@@ -1,33 +1,15 @@
 """
+
 BLAST XML Analysis Tool
+
 A Python module for parsing and analyzing BLAST XML results.
 Extracts key metrics from BLAST hits, classifies hit quality, identifies yeast
 organisms, and generates detailed reports including TSV files and HTML visualizations.
-Main Features:
-- Parse BLAST XML output and extract alignment metrics
-- Classify hit quality based on e-value, percent identity, and coverage
-- Identify and track yeast species hits
-- Generate detailed TSV reports with quality classifications
-- Create HTML report with embedded visualizations
-- Produce distribution plots for e-values, percent identity, and coverage
-- Fallback to TSV output when matplotlib is unavailable
-Key Functions:
-- analyze(): Main entry point for BLAST result analysis
-- parse_blast_results(): Parse BLAST XML and extract metrics
-- extract_hit_info(): Extract relevant information from individual BLAST hits
-- classify_hit_quality(): Classify hits as Good/OK/Poor based on thresholds
-- is_yeast(): Identify if organism is a yeast species
-- write_tsv_results(): Generate detailed results TSV
-- write_summary(): Generate summary TSV with quality labels
-- write_html_report(): Generate interactive HTML report
-- create_plots(): Generate matplotlib visualizations or fallback TSV files
-Dependencies:
-- BioPython (Bio.Blast.NCBIXML)
-- numpy (optional, for plotting)
-- matplotlib (optional, for visualizations)
+
 Usage:
     python blast_v3.py --xml <path_to_blast.xml> --out <output_dir> 
                        [--evalue <threshold>] [--top <n_species>]
+
 Output Files:
 - top_hits.tsv: Detailed results with all metrics
 - top_hits_summary.tsv: Summary with quality classification
@@ -36,6 +18,7 @@ Output Files:
 - distributions.png: Histograms of metrics (if matplotlib available)
 - species_counts.tsv, evalues.tsv, percent_id.tsv, coverage.tsv: 
   Fallback data files (if matplotlib unavailable)
+  
 """
 import os
 import re
