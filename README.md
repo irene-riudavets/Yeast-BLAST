@@ -16,6 +16,11 @@ A Python script for parsing and summarising NCBI BLAST XML results. It works wit
 
 ## Requirements
 
+**Python**
+```
+Python ≥ 3.8
+```
+
 **Required**
 ```
 biopython
