@@ -41,6 +41,10 @@ pip install biopython
 
 ## Usage
 
+```bash
+blast_v3.py [-h] [--xml XML] [--out OUT] [--evalue EVALUE] [--top TOP]
+```
+
 ### Basic run
 
 ```bash
