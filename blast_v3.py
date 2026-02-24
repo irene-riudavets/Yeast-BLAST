@@ -46,7 +46,7 @@ def extract_organism(title: str) -> str:
 
 
 def extract_pdb_id(hit_id: str, accession: str) -> str:
-    """Extract PDB code from BLAST hit identifiers.
+    """Extract a clean 4-character PDB code from BLAST hit identifiers.
 
     Handles both blastp format  (pdb|4YBB|A)
     and blastn/gi format        (gi|2981298973|pdb|8ZGR|LA).
@@ -110,7 +110,7 @@ def extract_hit_info(alignment, hsps, qlen, blast_type='blastp'):
 
     For blastn: aggregates coverage and identity across all HSPs (union of query
     spans for coverage; pooled identities/align-lengths for %identity).
-    For blastp: uses the single best HSP.
+    For blastp: uses the single best HSP as before.
     """
     title = alignment.title
 
@@ -140,7 +140,7 @@ def extract_hit_info(alignment, hsps, qlen, blast_type='blastp'):
         align_len  = total_align_len
 
     else:
-        # Single best HSP for protein BLAST
+        # Single best HSP for protein BLAST (original behaviour)
         hsp        = hsps[0]
         evalue     = hsp.expect
         bit_score  = getattr(hsp, 'bits', None)
@@ -163,15 +163,20 @@ def extract_hit_info(alignment, hsps, qlen, blast_type='blastp'):
     }
 
 
-def parse_blast_results(xml_path: str, evalue_threshold: float = None):
+def parse_blast_results(xml_path: str, evalue_threshold: float = None, top_n_hits: int = 10):
     """Parse BLAST XML and extract key metrics.
 
     Auto-detects blastp vs blastn from <BlastOutput_program> and adjusts
     coverage/identity calculations accordingly.
+
+    Also collects the top `top_n_hits` hits per query (by e-value) for PDB
+    structure frequency analysis — see rank_pdb_structures().
     """
     rows = []
     species_counter = Counter()
     evalues, pct_ids, coverages = [], [], []
+    # One list of top-N hit dicts per query, for PDB ranking
+    all_top_hits = []
 
     with open(xml_path) as result_handle:
         blast_records = NCBIXML.parse(result_handle)
@@ -192,6 +197,9 @@ def parse_blast_results(xml_path: str, evalue_threshold: float = None):
             best_yeast_hsps      = []
             best_yeast_evalue    = float('inf')
 
+            # Accumulate all valid alignments so we can pick the top N
+            valid_alignments = []
+
             for alignment in blast_record.alignments:
                 # Filter HSPs by e-value threshold if supplied
                 valid_hsps = [hsp for hsp in alignment.hsps
@@ -203,6 +211,8 @@ def parse_blast_results(xml_path: str, evalue_threshold: float = None):
                 # (treat 0 as best possible for comparison)
                 rep_evalue = min((h.expect if h.expect > 0 else 1e-300) for h in valid_hsps)
 
+                valid_alignments.append((rep_evalue, alignment, valid_hsps))
+
                 if rep_evalue < best_evalue:
                     best_evalue    = rep_evalue
                     best_alignment = alignment
@@ -213,6 +223,29 @@ def parse_blast_results(xml_path: str, evalue_threshold: float = None):
                     best_yeast_evalue     = rep_evalue
                     best_yeast_alignment  = alignment
                     best_yeast_hsps       = valid_hsps
+
+            # Build top-N hit list for PDB ranking (sorted best-first by e-value)
+            valid_alignments.sort(key=lambda x: x[0])
+            query_top_hits = []
+            for rank, (rep_ev, aln, hsps) in enumerate(valid_alignments[:top_n_hits], start=1):
+                if blast_type == 'blastp':
+                    h = min(hsps, key=lambda h: h.expect)
+                    hi = extract_hit_info(aln, [h], qlen, blast_type)
+                else:
+                    hi = extract_hit_info(aln, hsps, qlen, blast_type)
+                quality = classify_hit_quality(hi['evalue'], hi['pct_id'], hi['coverage'], blast_type)
+                query_top_hits.append({
+                    'query':    query,
+                    'rank':     rank,
+                    'pdb_id':   hi['pdb_id'],
+                    'organism': hi['organism'],
+                    'pct_id':   hi['pct_id'],
+                    'coverage': hi['coverage'],
+                    'evalue':   hi['evalue'],
+                    'quality':  quality,
+                    'title':    hi['title'],
+                })
+            all_top_hits.append(query_top_hits)
 
             # No hit
             if not best_alignment or not best_hsps:
@@ -254,11 +287,84 @@ def parse_blast_results(xml_path: str, evalue_threshold: float = None):
             if hit_info['pct_id']   is not None: pct_ids.append(hit_info['pct_id'])
             if hit_info['coverage'] is not None: coverages.append(hit_info['coverage'])
 
-    return rows, species_counter, evalues, pct_ids, coverages
+    return rows, species_counter, evalues, pct_ids, coverages, all_top_hits
+
+
+def rank_pdb_structures(all_top_hits):
+    """Rank PDB structures by how consistently they appear across all queries.
+
+    For each PDB code seen in the top-10 hits of any query we compute:
+      - appearances   : number of queries where this PDB appears in the top 10
+      - top1_count    : number of queries where it is the #1 hit
+      - good_count    : appearances classified as Good
+      - mean_pct_id   : average % identity across all appearances
+      - mean_coverage : average coverage across all appearances
+      - best_evalue   : lowest e-value seen across all appearances
+      - queries_covered: list of query names it appears in
+
+    Ranking score = appearances*3 + good_count*2 + ok_count*1
+    so breadth and quality are both rewarded.
+    """
+    pdb_stats = {}
+
+    for query_hits in all_top_hits:
+        for hit in query_hits:
+            pid = hit['pdb_id']
+            if not pid:
+                continue
+            if pid not in pdb_stats:
+                pdb_stats[pid] = {
+                    'pdb_id':          pid,
+                    'organism':        hit['organism'],
+                    'appearances':     0,
+                    'top1_count':      0,
+                    'good_count':      0,
+                    'ok_count':        0,
+                    'poor_count':      0,
+                    'pct_ids':         [],
+                    'coverages':       [],
+                    'best_evalue':     float('inf'),
+                    'queries_covered': [],
+                    'example_title':   simplify_title(hit['title']),
+                }
+            s = pdb_stats[pid]
+            s['appearances'] += 1
+            if hit['rank'] == 1:
+                s['top1_count'] += 1
+            q = hit['quality']
+            if q == 'Good':
+                s['good_count'] += 1
+            elif q == 'OK':
+                s['ok_count'] += 1
+            else:
+                s['poor_count'] += 1
+            if hit['pct_id'] is not None:
+                s['pct_ids'].append(hit['pct_id'])
+            if hit['coverage'] is not None:
+                s['coverages'].append(hit['coverage'])
+            ev = hit['evalue']
+            if ev is not None:
+                effective = ev if ev > 0 else 1e-300
+                if effective < s['best_evalue']:
+                    s['best_evalue'] = effective
+            if hit['query'] not in s['queries_covered']:
+                s['queries_covered'].append(hit['query'])
+
+    ranked = []
+    for s in pdb_stats.values():
+        s['mean_pct_id']   = round(sum(s['pct_ids'])   / len(s['pct_ids']),   2) if s['pct_ids']   else None
+        s['mean_coverage'] = round(sum(s['coverages']) / len(s['coverages']), 2) if s['coverages'] else None
+        s['score']         = s['appearances'] * 3 + s['good_count'] * 2 + s['ok_count'] * 1
+        if s['best_evalue'] == float('inf'):
+            s['best_evalue'] = None
+        ranked.append(s)
+
+    ranked.sort(key=lambda x: (-x['score'], -x['appearances'], -(x['mean_pct_id'] or 0)))
+    return ranked
 
 
 def write_tsv_results(rows, out_dir):
-    """Write TSV results."""
+    """Write detailed TSV results."""
     out_tsv = os.path.join(out_dir, 'top_hits.tsv')
     with open(out_tsv, 'w', newline='') as fh:
         writer = csv.writer(fh, delimiter='\t')
@@ -270,6 +376,28 @@ def write_tsv_results(rows, out_dir):
                 r['query'], r['title'], r['evalue'], r['bit_score'], 
                 r['identities'], r['align_len'], r['pct_id'], r['coverage'], 
                 r['organism'], r['pdb_id'], 'Yes' if r.get('is_yeast') else 'No'
+            ])
+
+
+def write_pdb_ranking_tsv(ranked, out_dir):
+    """Write PDB structure ranking to TSV."""
+    out_tsv = os.path.join(out_dir, 'pdb_ranking.tsv')
+    with open(out_tsv, 'w', newline='') as fh:
+        writer = csv.writer(fh, delimiter='\t')
+        writer.writerow([
+            'Rank', 'PDB_id', 'Score', 'Queries_covered', 'Appearances_in_top10',
+            'Top1_hits', 'Good_hits', 'OK_hits', 'Poor_hits',
+            'Mean_pct_identity', 'Mean_coverage', 'Best_evalue',
+            'Organism', 'Example_description'
+        ])
+        for i, s in enumerate(ranked, start=1):
+            n_queries = len(s['queries_covered'])
+            writer.writerow([
+                i, s['pdb_id'], s['score'], n_queries, s['appearances'],
+                s['top1_count'], s['good_count'], s['ok_count'], s['poor_count'],
+                s['mean_pct_id'], s['mean_coverage'],
+                f"{s['best_evalue']:.2e}" if s['best_evalue'] else '',
+                s['organism'], s['example_title']
             ])
 
 
@@ -305,7 +433,7 @@ def write_summary(rows, out_dir):
 
 
 def simplify_title(title):
-    """Extract description from a BLAST hit title.
+    """Extract a clean description from a BLAST hit title.
 
     Handles both blastp format  ('pdb|4YBB|A Chain A, protein [Organism]')
     and blastn/gi format        ('gi|...|pdb|8ZGR|LA Chain LA, 25S rRNA (3393-MER)').
@@ -330,7 +458,7 @@ def simplify_pdb_id(pdb_id):
     return clean_id.split('_')[0].split('|')[0].upper()
 
 
-def write_html_report(rows, out_dir):
+def write_html_report(rows, ranked_pdbs, out_dir):
     """Generate HTML report with embedded visualizations."""
     report_html = os.path.join(out_dir, 'blast_report.html')
     
@@ -341,25 +469,89 @@ def write_html_report(rows, out_dir):
     body{font-family:Arial,sans-serif;margin:20px}
     table{border-collapse:collapse;width:100%;margin-top:20px}
     th,td{border:1px solid #ccc;padding:6px;text-align:left;font-size:14px}
+    th{background:#f0f0f0;font-weight:bold}
     .Good{background:#d4f7d4}
     .OK{background:#fff4cc}
     .Poor{background:#ffd6d6}
     .NonYeast{background:#cbc3e3}
     img{max-width:100%;height:auto;margin:20px 0}
     .yeast-alt{font-size:0.9em;color:#666;margin-top:4px;padding-top:4px;border-top:1px dashed #999}
+    .pdb-rank-1{background:#fff7cc;font-weight:bold}
+    .pdb-rank-2{background:#f5f5f5}
+    .pdb-rank-3{background:#f5f5f5}
+    .score-bar-wrap{background:#e0e0e0;border-radius:4px;height:12px;min-width:60px}
+    .score-bar{background:#4a90d9;border-radius:4px;height:12px}
+    .tag-Good{background:#d4f7d4;padding:1px 6px;border-radius:3px;font-size:0.85em}
+    .tag-OK{background:#fff4cc;padding:1px 6px;border-radius:3px;font-size:0.85em}
+    .tag-Poor{background:#ffd6d6;padding:1px 6px;border-radius:3px;font-size:0.85em}
+    .section{margin-top:40px;padding-top:10px;border-top:2px solid #aaa}
 </style></head><body>
-<h1>BLAST Top-Hits Summary</h1>
+<h1>BLAST Summary</h1>
 ''')
-        
-        # Embed plots at the beginning - check if files exist
+
+        # --- PDB Structure Ranking section ---
+        fh.write('<div class="section">\n')
+        fh.write('<h2>PDB Structure Ranking</h2>\n')
+        fh.write('<p>Structures ranked by how often they appear in the top-10 hits across all query proteins, ')
+        fh.write('weighted by hit quality. A high score means the structure consistently provides good matches ')
+        fh.write('for many of your queries — making it a strong candidate for a complete ribosome structure.</p>\n')
+        fh.write('<p><strong>Score</strong> = appearances&nbsp;&times;&nbsp;3 + Good&nbsp;hits&nbsp;&times;&nbsp;2 + OK&nbsp;hits&nbsp;&times;&nbsp;1</p>\n')
+
+        if ranked_pdbs:
+            max_score = ranked_pdbs[0]['score'] or 1
+            total_queries = len(set(q for qlist in [s['queries_covered'] for s in ranked_pdbs] for q in qlist))
+            fh.write(f'<p>Showing top 10 structures out of {len(ranked_pdbs)} seen across {total_queries} queries.</p>\n')
+            fh.write('<table>\n<thead><tr>')
+            fh.write('<th>Rank</th><th>PDB</th><th>Score</th>')
+            fh.write('<th>Queries covered</th><th>Appearances<br>(top 10)</th>')
+            fh.write('<th>#1 hits</th><th>Quality breakdown</th>')
+            fh.write('<th>Mean % id</th><th>Mean coverage</th><th>Best E-value</th>')
+            fh.write('<th>Organism</th><th>Example description</th>')
+            fh.write('</tr></thead><tbody>\n')
+
+            for i, s in enumerate(ranked_pdbs[:10], start=1):
+                row_class = 'pdb-rank-1' if i == 1 else ('pdb-rank-2' if i <= 3 else '')
+                n_queries = len(s['queries_covered'])
+                bar_pct = int(100 * s['score'] / max_score)
+                pdb_link = f'<a href="https://www.rcsb.org/structure/{s["pdb_id"]}" target="_blank">{s["pdb_id"]}</a>'
+                quality_tags = (
+                    f'<span class="tag-Good">{s["good_count"]}G</span> ' if s["good_count"] else ''
+                    f'<span class="tag-OK">{s["ok_count"]}OK</span> ' if s["ok_count"] else ''
+                    f'<span class="tag-Poor">{s["poor_count"]}P</span>' if s["poor_count"] else ''
+                )
+                ev_str = f'{s["best_evalue"]:.2e}' if s["best_evalue"] else ''
+                fh.write(f'<tr class="{row_class}">')
+                fh.write(f'<td>{i}</td>')
+                fh.write(f'<td>{pdb_link}</td>')
+                fh.write(f'<td><div class="score-bar-wrap"><div class="score-bar" style="width:{bar_pct}%"></div></div>{s["score"]}</td>')
+                fh.write(f'<td>{n_queries}</td>')
+                fh.write(f'<td>{s["appearances"]}</td>')
+                fh.write(f'<td>{s["top1_count"]}</td>')
+                fh.write(f'<td>{quality_tags}</td>')
+                fh.write(f'<td>{s["mean_pct_id"] or ""}</td>')
+                fh.write(f'<td>{s["mean_coverage"] or ""}</td>')
+                fh.write(f'<td>{ev_str}</td>')
+                fh.write(f'<td>{s["organism"]}</td>')
+                fh.write(f'<td>{s["example_title"]}</td>')
+                fh.write('</tr>\n')
+
+            fh.write('</tbody></table>\n')
+        else:
+            fh.write('<p><em>No PDB hits found.</em></p>\n')
+        fh.write('</div>\n')
+
+        # Embed distribution plots
+        fh.write('<div class="section">\n')
         plot_files = ['top_species.png', 'distributions.png']
         for img in plot_files:
             img_path = os.path.join(out_dir, img)
             if os.path.exists(img_path):
                 fh.write(f'<div><img src="{img}" alt="{img}"></div>\n')
-        
-        # Write table
-        fh.write('<h2>Top hits</h2>\n')
+        fh.write('</div>\n')
+
+        # Write top-hits table
+        fh.write('<div class="section">\n')
+        fh.write('<h2>Top hits per query</h2>\n')
         fh.write('<p><strong>Note:</strong> Rows highlighted in light purple indicate non-yeast top hits. ')
         fh.write('Alternative yeast hits are shown below when available.</p>\n')
         fh.write('<table><thead><tr>')
@@ -403,6 +595,7 @@ def write_html_report(rows, out_dir):
         fh.write('<span class="Poor" style="padding:3px 8px">Poor</span> ')
         fh.write('<span class="NonYeast" style="padding:3px 8px">Non-yeast hit</span>')
         fh.write('</p>')
+        fh.write('</div>')  # close section div
         fh.write('</body></html>')
 
 
@@ -490,8 +683,11 @@ def analyze(xml_path: str, out_dir: str, evalue_threshold: float = None, top_n_s
     """Main analysis function."""
     os.makedirs(out_dir, exist_ok=True)
     
-    # Parse BLAST results
-    rows, species_counter, evalues, pct_ids, coverages = parse_blast_results(xml_path, evalue_threshold)
+    # Parse BLAST results (also collects top-10 hits per query for PDB ranking)
+    rows, species_counter, evalues, pct_ids, coverages, all_top_hits = parse_blast_results(xml_path, evalue_threshold)
+    
+    # Rank PDB structures by cross-query frequency and quality
+    ranked_pdbs = rank_pdb_structures(all_top_hits)
     
     # Create plots FIRST (before HTML report references them)
     create_plots(species_counter, evalues, pct_ids, coverages, out_dir, top_n_species)
@@ -499,7 +695,8 @@ def analyze(xml_path: str, out_dir: str, evalue_threshold: float = None, top_n_s
     # Write outputs
     write_tsv_results(rows, out_dir)
     write_summary(rows, out_dir)
-    write_html_report(rows, out_dir)
+    write_pdb_ranking_tsv(ranked_pdbs, out_dir)
+    write_html_report(rows, ranked_pdbs, out_dir)
     
     print(f"Analysis complete. Results saved to {out_dir}")
     
@@ -509,6 +706,14 @@ def analyze(xml_path: str, out_dir: str, evalue_threshold: float = None, top_n_s
     print(f"  Total queries: {len(rows)}")
     print(f"  Yeast top hits: {yeast_count}")
     print(f"  Non-yeast top hits: {non_yeast_count}")
+    
+    # Print top PDB structures
+    if ranked_pdbs:
+        print(f"\n  Top PDB structures across all queries:")
+        print(f"  {'Rank':<5} {'PDB':<6} {'Score':<7} {'Queries':<8} {'Good':<6} {'Mean%id':<9} {'Organism'}")
+        for i, s in enumerate(ranked_pdbs[:10], start=1):
+            org = s['organism'][:30] if s['organism'] else 'Unknown'
+            print(f"  {i:<5} {s['pdb_id']:<6} {s['score']:<7} {len(s['queries_covered']):<8} {s['good_count']:<6} {str(s['mean_pct_id'] or ''):<9} {org}")
 
 
 if __name__ == '__main__':
